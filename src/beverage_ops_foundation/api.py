@@ -13,8 +13,75 @@ from .service import DomainService
 from .storage import Database
 
 
+def _disposal_routes(service: DomainService, disposal, method: str, path: str,
+                     body: dict[str, Any], query: dict[str, list[str]],
+                     actor_id: str) -> tuple[int, dict[str, Any]] | None:
+    """处置域路由；无法识别时返回 None 交回基础路由。"""
+
+    def q(name: str, default: str | None = None) -> str | None:
+        return query.get(name, [default])[0]
+
+    def receipt(call) -> tuple[int, dict[str, Any]]:
+        result = call(actor_id=actor_id, **body)
+        return 200 if result.replayed else 201, result.as_dict()
+
+    try:
+        if method == "POST" and path == "/disposal/rules":
+            return receipt(disposal.publish_rule)
+        if method == "POST" and path == "/disposal/batches":
+            return receipt(disposal.register_batch)
+        if method == "GET" and path == "/disposal/batches":
+            items = [item.__dict__ for item in disposal.list_batches(
+                product_id=q("product_id"), distributor_id=q("distributor_id"))]
+            return 200, {"items": items}
+        if method == "GET" and path.startswith("/disposal/batches/"):
+            batch_id = path.rsplit("/", 1)[-1]
+            return 200, disposal.get_batch(batch_id).__dict__
+        if method == "POST" and path == "/disposal/freezes":
+            return receipt(disposal.freeze_batch)
+        if method == "POST" and path == "/disposal/freezes/release":
+            return receipt(disposal.release_freeze)
+        if method == "GET" and path.startswith("/disposal/freezes/"):
+            batch_id = path.rsplit("/", 1)[-1]
+            return 200, {"items": [item.__dict__ for item in disposal.list_freezes(batch_id)]}
+        if method == "POST" and path == "/disposal/plans":
+            return receipt(disposal.create_plan)
+        if method == "POST" and path == "/disposal/plans/approve":
+            return receipt(disposal.approve_plan)
+        if method == "POST" and path == "/disposal/plans/revise":
+            return receipt(disposal.revise_plan)
+        if method == "GET" and path.startswith("/disposal/plans/"):
+            plan_id = path.rsplit("/", 1)[-1]
+            return 200, disposal.get_plan(plan_id)
+        if method == "POST" and path == "/disposal/steps/handoff":
+            return receipt(disposal.confirm_handoff)
+        if method == "POST" and path == "/disposal/steps/execute":
+            return receipt(disposal.execute_step)
+        if method == "POST" and path == "/disposal/steps/refund":
+            return receipt(disposal.record_refund)
+        if method == "GET" and path.startswith("/disposal/steps/"):
+            step_id = path.rsplit("/", 1)[-1]
+            return 200, disposal.get_step(step_id)
+        if method == "GET" and path == "/disposal/open-actions":
+            return 200, disposal.open_actions(
+                product_id=q("product_id"), distributor_id=q("distributor_id"),
+                overdue_only=q("overdue_only") == "true")
+        if method == "GET" and path == "/disposal/profit-loss":
+            return 200, disposal.profit_loss_basis(
+                product_id=q("product_id"), distributor_id=q("distributor_id"))
+        if method == "GET" and path.startswith("/disposal/custody-chain/"):
+            batch_id = path.rsplit("/", 1)[-1]
+            return 200, disposal.custody_chain(batch_id)
+        if method == "GET" and path == "/disposal/conservation":
+            return 200, disposal.verify_conservation()
+        return None
+    except TypeError as exc:
+        raise ValidationError(str(exc)) from exc
+
+
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          disposal=None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
@@ -22,6 +89,16 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
     try:
+        if parsed.path.startswith("/disposal/"):
+            if disposal is None:
+                from .disposal import DisposalService
+                disposal = DisposalService(service.database, service.clock)
+            query = parse_qs(parsed.query)
+            dispatched = _disposal_routes(service, disposal, method, parsed.path, body,
+                                          query, actor_id)
+            if dispatched is not None:
+                return dispatched
+            return 404, {"error": "route_not_found", "message": "处置接口不存在"}
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
             return 200, {"status": "ok", "audit_valid": valid, "audit_events": count}
@@ -59,6 +136,7 @@ class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    disposal: object = None
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +147,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                disposal=self.disposal)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -100,6 +179,8 @@ def main() -> int:
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    from .disposal import DisposalService
+    Handler.disposal = DisposalService(database, Handler.service.clock)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
