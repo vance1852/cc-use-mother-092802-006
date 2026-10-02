@@ -76,6 +76,10 @@ class Database:
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 5000")
         self.connection.executescript(SCHEMA)
+        # 领域扩展：老产品处置平台表结构（与基础表同库同事务）。
+        from .disposal_storage import ensure_disposal_schema
+
+        ensure_disposal_schema(self.connection)
 
     @contextmanager
     def transaction(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
